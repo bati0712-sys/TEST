@@ -1,0 +1,31 @@
+# Build artifacts
+dist/
+build/
+*.zip
+*.spec.bak
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Claude internal
+.claude/
+
+# VS Code
+.vscode/
+
+# Data sensible (JSONs con configs/datos de producción)
+**/data/*.json
+**/data/*.tmp
+
+# Logs
+**/logs/
+
+# Excel temporales
+~$*.xlsx
+~$*.xlsm
+
+# pyinstaller
+*.manifest
