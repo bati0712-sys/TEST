@@ -54,6 +54,51 @@ App PySide6 que reemplaza y mejora GeneradorLetras_v13.xlsm:
 - Exporta cronograma a Excel (openpyxl)
 - Build: `GeneradorLetras.spec` + `build.bat` → ZIP `GeneradorLetras_red_vYYYYMMDD.zip`
 
+### [GeneradorLetras_web](GeneradorLetras_web/)
+`F:\vcode\GeneradorLetras_web\` — versión web de GeneradorLetras (misma lógica, nueva interfaz)
+- **Backend**: FastAPI + uvicorn (`backend/main.py`), motor de cálculo en `backend/engine.py`
+- **Frontend**: SPA vanilla JS ES modules, sin build step (`frontend/`)
+- Arranque: `python run.py --port 8001` → `http://127.0.0.1:8001`
+- Datos en `backend/data/` (mismos JSON que el desktop)
+
+#### Dyspow — `BD_DYSPOW_BFX` en 192.168.1.114
+Credenciales en `backend/data/dyspow_config.json` — nunca exponer password por GET; PUT conserva password existente si el cliente envía vacío.
+
+**Tablas principales:**
+
+| Tabla | Descripción | Campos clave |
+|---|---|---|
+| `T_267_LETRA_PAGO` | Planilla de Letras en Cartera (PLC) — cabecera del documento de pago | `C_VAR_NUMERO_LETRA_PAGO` (ej. PLC-202512-000000014), `C_INT_CODIGO_PROVEEDOR`, `C_INT_CODIGO_MONEDA`, `C_INT_CODIGO_TIPO_CAMBIO`, `C_INT_CANTIDAD_LETRA`, `C_DEC_TOTAL`, `C_INT_CODIGO_ESTADO` |
+| `T_268_LETRA_PAGO_DETALLE` | Facturas/compras vinculadas a cada PLC | `C_INT_CODIGO_LETRA_PAGO` (FK→T_267), `C_INT_CODIGO_COMPRA` (FK→T_122), `C_DEC_IMPORTE`, `C_DEC_TOTAL` (PEN), `C_INT_ITEM` |
+| `T_269_CANJE_PAGO` | **Letras individuales emitidas** (una fila por letra de cambio) — es la tabla correcta para Datos Externos | `C_INT_CODIGO_LETRA_PAGO` (FK→T_267), `C_INT_CODIGO_CANJE` (PK), `C_VAR_NUMERO_SERIE` (ej. PV26), `C_VAR_NUMERO_CANJE` (ej. 353), `C_DAT_FECHA_EMISION`, `C_DAT_FECHA_VENCIMIENTO`, `C_DEC_IMPORTE`, `C_VAR_LUGAR_GIRO`, `C_VAR_CODIGO_UNICO`, `C_INT_CODIGO_ETAPA` |
+| `T_514_SALDO_INICIAL_LETRA_COMPRA` | Letras de saldo inicial (anteriores al sistema Dyspow) | `C_VAR_NUMERO_SERIE`, `C_VAR_NUMERO_DOCUMENTO`, `C_DAT_FECHA_EMISION`, `C_DAT_FECHA_PAGO` (vcto), `C_DEC_TOTAL`, `C_INT_CODIGO_PROVEEDOR`, `C_VAR_NUMERO_UNICO` |
+| `T_122_COMPRA` | Facturas/compras de proveedores | `C_INT_CODIGO_COMPRA`, `C_VAR_NUMERO_SERIE`, `C_VAR_NUMERO_DOCUMENTO`, `C_DAT_FECHA_EMISION`, `C_INT_CODIGO_PROVEEDOR` |
+| `T_060_PROVEEDOR` | Proveedores | `C_INT_CODIGO_PROVEEDOR`, `C_VAR_RAZON_SOCIAL` — JOIN sin FK de empresa |
+| `T_019_EMPRESA` | Empresas | `C_INT_CODIGO_EMPRESA`, `C_VAR_RAZON_SOCIAL` |
+| `T_066_MONEDA` | Monedas | `C_INT_CODIGO_EMPRESA`, `C_INT_CODIGO_MONEDA`, `C_VAR_CODIGO_SUNAT` |
+| `T_067_TIPO_CAMBIO` | Tipos de cambio | `C_INT_CODIGO_EMPRESA`, `C_INT_CODIGO_TIPO_CAMBIO`, `C_DEC_VENTA` ← usar este |
+| `T_633_ETAPA_LETRA_PAGO` | Estados de letra individual | 1=EN CARTERA, 2=EN RENOVACION, 3=ENDOSADA A TERCEROS, 4=EN DESCUENTO, 5=EN PROTESTO |
+
+**Relación clave:**
+- 1 PLC (T_267) → N letras individuales (T_269) vía `C_INT_CODIGO_LETRA_PAGO`
+- 1 PLC (T_267) → N facturas (T_268) → T_122 vía `C_INT_CODIGO_COMPRA`
+- `T_267.C_INT_CANTIDAD_LETRA` = total de rows en T_269 para ese PLC
+
+**Import Datos Externos** (`POST /api/dyspow/importar-letras`):
+- Query UNION ALL: T_269 JOIN T_267 + T_060 + T_019 + T_066 + T_067 + T_633 **UNION** T_514 + T_060 + T_019 + T_066 + T_067
+- Descripción = `{PLC_REF} / {SERIE}-{NUMERO_CANJE}` (ej. "PLC-202512-000000014 / PV26-353")
+- Total: ~1893 letras (1436 de T_269 + 457 de T_514)
+
+**Otros endpoints Dyspow:**
+- `GET /api/dyspow/schema/{tabla}` — columnas de cualquier tabla (diagnóstico)
+- `POST /api/dyspow/importar-proveedores` — importa T_060 → base.json (sin duplicar por nombre)
+- `POST /api/dyspow/importar-empresas` — importa T_019 → base.json (sin duplicar)
+
+#### Funcionalidades del frontend
+- **Histórico**: búsqueda global + filtros por Proveedor/Temporada/Moneda/Estado + ordenamiento por columna + importar desde Excel (plantilla descargable)
+- **Datos Externos**: búsqueda + filtros por Empresa/Proveedor/Estado/Fuente/Fecha rango + ordenamiento por columna
+- Migración automática de `externos.json` viejo (formato desktop) al nuevo formato en GET /api/externos
+
 ## Stack técnico común
 - **Python** + **PySide6** (QThread, Signal/Slot)
 - **pyodbc** con ODBC Driver 17 for SQL Server
