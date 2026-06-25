@@ -1,7 +1,18 @@
 [redbf]
-server_url = http://192.168.1.71:8077
-token = redbf-lan-2026
+# Servidor central RedBF (produccion via internet)
+server_url = https://app.brunoferrini.pe
+# Prefijo de la API del modulo integrado en AppBF
+api_prefix = /api/redbf
+# Token de agente — reemplazar por el REDBF_AGENT_TOKEN real del VPS,
+# o generar uno por equipo desde el panel RedBF (Tokens). NO commitear el real.
+token = REEMPLAZAR_CON_TOKEN_DEL_VPS
+# Cada cuantos minutos reporta inventario
 intervalo_min = 10
+# Cada cuantos segundos revisa comandos pendientes
 poll_comandos_s = 4
+# Incluir lista de software instalado
 incluir_software = true
+# Incluir resumen de navegacion web por dominio (requiere politica informada)
 incluir_navegacion = true
+# Validar certificado TLS (true en produccion con dominio real)
+ssl_verify = true
