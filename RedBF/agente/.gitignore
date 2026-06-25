@@ -1,0 +1,17 @@
+# Artefactos de build (PyInstaller)
+build/
+dist/
+*.exe
+*.pkg
+*.zip
+
+# Instalador empaquetado (contiene binarios)
+installer/redbf-agent.exe
+installer/nssm.exe
+
+# Config con token/credenciales (usar config.ini.example como plantilla)
+config.ini
+
+# Python
+__pycache__/
+*.pyc

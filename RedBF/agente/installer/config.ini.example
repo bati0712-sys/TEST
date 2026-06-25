@@ -1,0 +1,7 @@
+[redbf]
+server_url = http://192.168.1.71:8077
+token = redbf-lan-2026
+intervalo_min = 10
+poll_comandos_s = 4
+incluir_software = true
+incluir_navegacion = true
