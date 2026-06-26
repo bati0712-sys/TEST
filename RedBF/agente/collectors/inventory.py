@@ -50,9 +50,118 @@ def _ps_json(script: str, timeout: int = 40):
 
 
 # ── Identidad ──────────────────────────────────────────────────────
+_MID_BASURA = {"", "ffffffff-ffff-ffff-ffff-ffffffffffff",
+               "00000000-0000-0000-0000-000000000000",
+               "03000200-0400-0500-0006-000700080009"}
+
+
+def _mid_valido(v: str) -> bool:
+    v = (v or "").strip().lower()
+    return bool(v) and v not in _MID_BASURA and "to be filled" not in v and v.strip("0") != ""
+
+
+def _uuid_smbios() -> str:
+    """UUID SMBIOS por varias vías independientes (no solo PowerShell/CIM, que en
+    algunas PCs de tienda falla o se cuelga). Orden: wmic → CIM → WMI clásico."""
+    # 1) wmic (rápido, sin levantar PowerShell; existe en Win7→Win10, a veces no Win11)
+    out = _run(["wmic", "csproduct", "get", "UUID", "/value"], timeout=15)
+    for line in out.splitlines():
+        if "=" in line:
+            v = line.split("=", 1)[1].strip()
+            if _mid_valido(v):
+                return v.upper()
+    # 2) CIM (PowerShell moderno)
+    v = (_ps("(Get-CimInstance Win32_ComputerSystemProduct).UUID", timeout=20) or "").strip()
+    if _mid_valido(v):
+        return v.upper()
+    # 3) WMI clásico (Get-WmiObject) — distinto subsistema, a veces responde cuando CIM no
+    v = (_ps("(Get-WmiObject Win32_ComputerSystemProduct).UUID", timeout=20) or "").strip()
+    if _mid_valido(v):
+        return v.upper()
+    return ""
+
+
+def _machine_guid() -> str:
+    """MachineGuid del registro (HKLM\\SOFTWARE\\Microsoft\\Cryptography). Es un GUID
+    estable por instalación de Windows — NO sobrevive a reinstalar SO, pero sí a
+    renombrar la PC. Lectura por registro: rapidísima y sin WMI."""
+    out = _run(["reg", "query",
+                r"HKLM\SOFTWARE\Microsoft\Cryptography", "/v", "MachineGuid"], timeout=10)
+    m = re.search(r"MachineGuid\s+REG_SZ\s+([0-9a-fA-F-]{36})", out)
+    if m and _mid_valido(m.group(1)):
+        return m.group(1).upper()
+    return ""
+
+
+def _mac_fisica() -> str:
+    """MAC del adaptador físico (fallback). Intenta PowerShell; si falla, usa
+    getmac (nativo) y por último uuid.getnode() de Python — para no quedar sin ID."""
+    macs = _ps(
+        "Get-CimInstance Win32_NetworkAdapter -Filter 'PhysicalAdapter=True' | "
+        "Where-Object { $_.MACAddress -and "
+        "$_.Name -notmatch 'Virtual|VMware|Hyper-V|Loopback|VPN|TAP|Bluetooth' } | "
+        "Select-Object -ExpandProperty MACAddress",
+        timeout=20) or ""
+    candidatas = sorted({m.strip().upper().replace("-", ":") for m in macs.splitlines()
+                         if m.strip() and m.strip().upper() not in ("00:00:00:00:00:00",)})
+    if not candidatas:
+        # getmac nativo (no usa WMI). Formato: "00-E0-4C-..."
+        out = _run(["getmac", "/fo", "csv", "/nh"], timeout=15)
+        candidatas = sorted({
+            mm.upper().replace("-", ":")
+            for mm in re.findall(r"([0-9A-Fa-f]{2}(?:[-:][0-9A-Fa-f]{2}){5})", out)
+            if mm.upper().replace("-", ":") != "00:00:00:00:00:00"})
+    if candidatas:
+        return f"MAC:{candidatas[0]}"
+    # Último recurso: MAC del nodo vía Python puro (siempre da algo si hay NIC).
+    try:
+        import uuid as _uuidmod
+        n = _uuidmod.getnode()
+        if (n >> 40) % 2 == 0:  # bit multicast en 0 => MAC real, no aleatoria
+            mac = ":".join(f"{(n >> (i*8)) & 0xff:02X}" for i in reversed(range(6)))
+            if mac != "00:00:00:00:00:00":
+                return f"MAC:{mac}"
+    except Exception:
+        pass
+    return ""
+
+
+def _machine_id() -> str:
+    """Identificador ESTABLE de la máquina, independiente del hostname.
+
+    Permite que el servidor reconozca una PC aunque la renombren (caso típico
+    en tiendas) y actualice su registro en vez de crear un duplicado fantasma.
+
+    Prioridad (cada nivel usa varias vías por si una falla en la PC):
+      1) UUID SMBIOS (wmic/CIM/WMI) — sobrevive a reinstalar Windows.
+      2) Serial de BIOS.
+      3) MachineGuid del registro — estable salvo reinstalar SO.
+      4) MAC del adaptador físico (PowerShell/getmac/Python).
+    Antes solo usaba PowerShell-CIM; si esa vía fallaba (WMI lento/roto en algunas
+    PCs de tienda) el id quedaba vacío y la PC perdía la protección anti-duplicado.
+    """
+    uuid = _uuid_smbios()
+    if uuid:
+        return uuid
+    serie = (_run(["wmic", "bios", "get", "SerialNumber", "/value"], timeout=15) or "")
+    for line in serie.splitlines():
+        if "=" in line:
+            v = line.split("=", 1)[1].strip()
+            if _mid_valido(v):
+                return f"BIOS:{v}"
+    serie = (_ps("(Get-CimInstance Win32_BIOS).SerialNumber", timeout=20) or "").strip()
+    if _mid_valido(serie):
+        return f"BIOS:{serie}"
+    guid = _machine_guid()
+    if guid:
+        return f"WGUID:{guid}"
+    return _mac_fisica()
+
+
 def identidad() -> dict:
     return {
         "hostname": socket.gethostname(),
+        "machine_id": _machine_id(),
         "usuario_actual": os.environ.get("USERNAME", ""),
         "dominio": os.environ.get("USERDOMAIN", ""),
         "fecha_reporte": datetime.now(timezone.utc).isoformat(),

@@ -23,7 +23,7 @@ import urllib.error
 from collectors import inventory
 
 log = logging.getLogger("redbf_agent")
-__version__ = "0.1.0"
+__version__ = "0.1.2"  # machine_id robusto + updater espera proceso muerto y no arranca exe viejo si el swap falla
 
 
 def _base_dir() -> Path:
@@ -122,35 +122,54 @@ def _auto_update() -> tuple[str, dict]:
         stop_cmd = f"sc stop {servicio}"
         start_cmd = f"sc start {servicio}"
 
+    log_upd = os.path.join(carpeta, "_redbf_update.log")
     bat_content = f"""@echo off
 REM Auto-update RedBF Agent. Corre como tarea programada SYSTEM (fuera del arbol
 REM del servicio). El agente sale limpio con su handler de senales.
+REM Escribe resultado en _redbf_update.log para que el agente nuevo lo reporte.
+echo [%date% %time%] inicio update > "{log_upd}"
 {cfg_stop}REM 1) detener el servicio
 {stop_cmd} >nul 2>&1
 ping -n 3 127.0.0.1 >nul 2>&1
-REM 2) asegurar que no quede ningun proceso del agente bloqueando el .exe
+REM 2) esperar a que el proceso muera de verdad (poll real, no solo sleep).
+REM    En PCs lentas el exe sigue bloqueado un rato tras el stop -> el move falla.
+set /a waitp=0
+:killloop
 taskkill /F /IM redbf-agent.exe >nul 2>&1
 ping -n 2 127.0.0.1 >nul 2>&1
-REM 3) reemplazar el binario (reintenta hasta que se libere)
+tasklist /FI "IMAGENAME eq redbf-agent.exe" 2>nul | find /I "redbf-agent.exe" >nul 2>&1
+if not errorlevel 1 (
+    set /a waitp+=1
+    if %waitp% lss 30 goto killloop
+)
+REM 3) reemplazar el binario (reintenta hasta 40 veces ~80s)
 set /a tries=0
 :wait
 move /Y "{exe_new}" "{exe_actual}" >nul 2>&1
-if errorlevel 1 (
-    set /a tries+=1
-    if %tries% geq 20 goto restart
-    ping -n 2 127.0.0.1 >nul 2>&1
-    goto wait
-)
-:restart
-REM 4) arrancar; si queda en pending tras 4s, forzar otro ciclo
+if not errorlevel 1 goto moved
+set /a tries+=1
+if %tries% geq 40 goto movefail
+ping -n 3 127.0.0.1 >nul 2>&1
+goto wait
+:movefail
+REM El swap NO se logro (exe bloqueado). NO arrancar con el viejo: registrar fallo,
+REM dejar el .new para el proximo intento y arrancar el servicio viejo (sigue vivo).
+echo [%date% %time%] ERROR move fallo tras 40 intentos, exe sin reemplazar >> "{log_upd}"
 {start_cmd} >nul 2>&1
-ping -n 5 127.0.0.1 >nul 2>&1
+goto fin
+:moved
+echo [%date% %time%] OK exe reemplazado >> "{log_upd}"
+REM 4) arrancar; si queda en pending tras 5s, forzar otro ciclo
+{start_cmd} >nul 2>&1
+ping -n 6 127.0.0.1 >nul 2>&1
 sc query {servicio} | find "RUNNING" >nul 2>&1
 if errorlevel 1 (
+    echo [%date% %time%] reintento start >> "{log_upd}"
     {stop_cmd} >nul 2>&1
-    ping -n 2 127.0.0.1 >nul 2>&1
+    ping -n 3 127.0.0.1 >nul 2>&1
     {start_cmd} >nul 2>&1
 )
+:fin
 del "{exe_new}" >nul 2>&1
 schtasks /Delete /F /TN RedBF_AutoUpdate >nul 2>&1
 del "%~f0" >nul 2>&1
