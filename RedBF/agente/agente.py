@@ -23,7 +23,7 @@ import urllib.error
 from collectors import inventory
 
 log = logging.getLogger("redbf_agent")
-__version__ = "0.1.2"  # machine_id robusto + updater espera proceso muerto y no arranca exe viejo si el swap falla
+__version__ = "0.1.3"  # NOTIFICAR auto-verificado: reporta OK solo si el aviso se vio (testigo); ERROR honesto si sesión bloqueada/sin login
 
 
 def _base_dir() -> Path:
@@ -209,15 +209,42 @@ def _notificar(titulo: str, mensaje: str) -> tuple[str, dict]:
     Como el agente está en Session 0, lanza el modo --toast en la sesión
     interactiva (helper). Si corre interactivo, lo muestra directo."""
     # codificar argumentos para pasarlos por la línea de comando del helper
-    import base64
+    import base64, tempfile, time, uuid
     t_b64 = base64.b64encode(titulo.encode("utf-8")).decode("ascii")
     m_b64 = base64.b64encode(mensaje.encode("utf-8")).decode("ascii")
 
+    # Archivo testigo: el helper escribe "1" si el usuario vio el aviso, "0" si
+    # corrió pero no había escritorio interactivo visible. Generamos la ruta
+    # absoluta aquí (en Session 0 gettempdir => C:\Windows\Temp) y se la pasamos
+    # al helper, que escribe en esa MISMA ruta. Es el patrón ya probado por la
+    # captura de pantalla (pantalla.py _captura_via_helper).
+    testigo = os.path.join(tempfile.gettempdir(), f"_redbf_notify_{uuid.uuid4().hex}.flag")
+    try:
+        if os.path.exists(testigo):
+            os.remove(testigo)
+    except OSError:
+        pass
+
     if getattr(sys, "frozen", False):
-        cmdline = f'"{sys.executable}" --toast "{t_b64}" "{m_b64}"'
+        cmdline = f'"{sys.executable}" --toast "{t_b64}" "{m_b64}" "{testigo}"'
     else:
         agente_py = os.path.abspath(__file__)
-        cmdline = f'"{sys.executable}" "{agente_py}" --toast "{t_b64}" "{m_b64}"'
+        cmdline = f'"{sys.executable}" "{agente_py}" --toast "{t_b64}" "{m_b64}" "{testigo}"'
+
+    def _leer_testigo(espera_s: float = 12.0) -> str | None:
+        """Espera a que el helper escriba el testigo. Devuelve '1'/'0' o None si
+        nunca apareció (helper murió antes de pintar)."""
+        deadline = time.time() + espera_s
+        while time.time() < deadline:
+            try:
+                with open(testigo, "r", encoding="ascii") as _f:
+                    val = _f.read().strip()
+                if val:
+                    return val
+            except OSError:
+                pass
+            time.sleep(0.4)
+        return None
 
     try:
         from collectors import session_helper
@@ -229,13 +256,29 @@ def _notificar(titulo: str, mensaje: str) -> tuple[str, dict]:
             ok = _lanzar_en_sesion_async(cmdline)
             if not ok:
                 return "ERROR", {"error": "no hay sesión de usuario activa para mostrar la notificación"}
-            return "OK", {"mensaje": "notificación mostrada al usuario"}
+            # No basta con lanzar el helper: confirmamos por el testigo que el
+            # aviso se VIO de verdad (antes esto reportaba OK falso aunque el
+            # usuario no viera nada — p. ej. sesión bloqueada/sin login).
+            val = _leer_testigo()
+            if val == "1":
+                return "OK", {"mensaje": "notificación mostrada al usuario"}
+            if val == "0":
+                return "ERROR", {"error": "sesión sin escritorio visible (bloqueada o sin usuario logueado); el aviso no se mostró"}
+            return "ERROR", {"error": "no se pudo confirmar que el aviso se mostró (helper sin respuesta)"}
         else:
             from collectors import notificar
-            notificar.mostrar_toast(titulo, mensaje)
-            return "OK", {"mensaje": "notificación mostrada (interactivo)"}
+            visto = notificar.mostrar_toast(titulo, mensaje)
+            if visto:
+                return "OK", {"mensaje": "notificación mostrada (interactivo)"}
+            return "ERROR", {"error": "sin escritorio visible; el aviso no se mostró"}
     except Exception as e:
         return "ERROR", {"error": f"{type(e).__name__}: {e}"}
+    finally:
+        try:
+            if os.path.exists(testigo):
+                os.remove(testigo)
+        except OSError:
+            pass
 
 
 # ── Control remoto en vivo ─────────────────────────────────────────
@@ -518,12 +561,26 @@ if __name__ == "__main__":
         control_remoto.ejecutar_control(sys.argv[2], sys.argv[3],
                                         modo=_modo, operador=_operador, ssl_verify=_sslv)
         sys.exit(0)
-    # Modo toast (invocado en la sesión del usuario): --toast <titulo_b64> <mensaje_b64>
+    # Modo toast (invocado en la sesión del usuario):
+    #   --toast <titulo_b64> <mensaje_b64> [<ruta_testigo>]
+    # El testigo (si se pasa) es un archivo que el agente en Session 0 vigila para
+    # confirmar que el toast se MOSTRÓ de verdad. Escribimos "1" si el usuario lo
+    # vio (MessageBox creado) o "0" si corrió pero no había escritorio visible.
     if len(sys.argv) >= 3 and sys.argv[1] == "--toast":
         import base64
         from collectors import notificar
         titulo = base64.b64decode(sys.argv[2]).decode("utf-8")
         mensaje = base64.b64decode(sys.argv[3]).decode("utf-8") if len(sys.argv) > 3 else ""
-        notificar.mostrar_toast(titulo, mensaje)
-        sys.exit(0)
+        visto = False
+        try:
+            visto = notificar.mostrar_toast(titulo, mensaje)
+        finally:
+            testigo = sys.argv[4] if len(sys.argv) > 4 else ""
+            if testigo:
+                try:
+                    with open(testigo, "w", encoding="ascii") as _f:
+                        _f.write("1" if visto else "0")
+                except OSError:
+                    pass
+        sys.exit(0 if visto else 2)
     main()

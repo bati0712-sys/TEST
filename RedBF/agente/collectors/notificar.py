@@ -46,21 +46,27 @@ Start-Sleep -Milliseconds 500
 """
 
 
-def _messagebox(titulo: str, mensaje: str):
+def _messagebox(titulo: str, mensaje: str) -> bool:
     """MessageBox nativo (user32) — SIEMPRE visible en la sesión del usuario.
     Es el método más confiable: el toast de Windows.UI.Notifications a veces se
     'muestra' silenciosamente (Foco Asistido, notificaciones de PS desactivadas)
-    y el usuario no lo ve. El MessageBox no tiene ese problema."""
+    y el usuario no lo ve. El MessageBox no tiene ese problema.
+
+    Devuelve True solo si el cuadro se mostró REALMENTE. MessageBoxW retorna 0
+    cuando falla (p. ej. la sesión no tiene un escritorio interactivo visible:
+    pantalla de bloqueo, sin usuario logueado, o escritorio Winlogon). Ese 0 es
+    la señal que distingue 'mostrado' de 'lanzado pero invisible'."""
     try:
         import ctypes
         MB_OK = 0x0
         MB_ICONINFORMATION = 0x40
         MB_TOPMOST = 0x40000
         MB_SETFOREGROUND = 0x10000
-        ctypes.windll.user32.MessageBoxW(
+        ret = ctypes.windll.user32.MessageBoxW(
             0, str(mensaje), str(titulo or "RedBF"),
             MB_OK | MB_ICONINFORMATION | MB_TOPMOST | MB_SETFOREGROUND)
-        return True
+        # ret == 0 => MessageBox no pudo crearse (sin escritorio interactivo).
+        return ret != 0
     except Exception:
         return False
 
@@ -71,7 +77,12 @@ def mostrar_toast(titulo: str, mensaje: str) -> bool:
 
     Estrategia: intenta el toast nativo (bonito, esquina) Y ADEMÁS un MessageBox
     garantizado-visible. El toast puede no verse según la config de Windows; el
-    MessageBox siempre se ve. Así el mensaje SIEMPRE llega al usuario."""
+    MessageBox siempre se ve. Así el mensaje SIEMPRE llega al usuario.
+
+    Devuelve True solo si el MessageBox se mostró realmente (hay escritorio
+    interactivo visible). False indica que el proceso corrió pero el usuario NO
+    vio nada (sesión bloqueada / sin login) → el agente debe reportarlo como tal
+    en vez de un OK falso."""
     # 1) intentar el toast (no bloqueante, decorativo)
     script = _ps_toast_script(titulo, mensaje)
     tmp = os.path.join(tempfile.gettempdir(), f"_redbf_toast_{os.getpid()}.ps1")
@@ -90,9 +101,9 @@ def mostrar_toast(titulo: str, mensaje: str) -> bool:
             os.remove(tmp)
         except OSError:
             pass
-    # 2) MessageBox garantizado-visible (lo que el usuario sí ve)
-    _messagebox(titulo, mensaje)
-    return True
+    # 2) MessageBox garantizado-visible (lo que el usuario sí ve). Su retorno es
+    #    la prueba de que hubo un escritorio interactivo donde pintarlo.
+    return _messagebox(titulo, mensaje)
 
 
 def _fallback_msgbox(titulo: str, mensaje: str):
