@@ -85,12 +85,25 @@ def _virtual_screen():
 
 
 def mover_mouse(nx: float, ny: float):
-    """nx,ny normalizados 0..1 sobre la pantalla virtual."""
-    # SendInput ABSOLUTE usa 0..65535 sobre la pantalla virtual completa
-    ax = int(max(0.0, min(1.0, nx)) * 65535)
-    ay = int(max(0.0, min(1.0, ny)) * 65535)
+    """nx,ny normalizados 0..1 sobre el MONITOR que se está viendo.
+
+    El cliente normaliza sobre el canvas (= el monitor activo). Para inyectar el
+    input hay que reproyectar esas coords al rectángulo real de ese monitor en la
+    pantalla virtual, y de ahí a 0..65535 (que SendInput ABSOLUTE mide sobre la
+    virtual completa). Si `_activo` cubre toda la virtual (modo "Todos"), el mapeo
+    es la identidad."""
+    nx = max(0.0, min(1.0, nx))
+    ny = max(0.0, min(1.0, ny))
+    vsx, vsy, vsw, vsh = _virtual_screen()
+    m = _grabber.get("rect") or {"left": vsx, "top": vsy, "width": vsw, "height": vsh}
+    # coord absoluta en px sobre la virtual
+    px = m["left"] + nx * m["width"]
+    py = m["top"] + ny * m["height"]
+    # a 0..65535 sobre la virtual (evitar div/0)
+    ax = int((px - vsx) / max(1, vsw) * 65535)
+    ay = int((py - vsy) / max(1, vsh) * 65535)
     inp = INPUT(type=INPUT_MOUSE)
-    inp.u.mi = MOUSEINPUT(ax, ay, 0,
+    inp.u.mi = MOUSEINPUT(max(0, min(65535, ax)), max(0, min(65535, ay)), 0,
                           MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | 0x4000,  # +VIRTUALDESK
                           0, None)
     _send(inp)
@@ -137,7 +150,46 @@ def escribir_unicode(ch: str):
 # oficina (escribir, mover el mouse) eso es ~2-5% de la pantalla por frame.
 TILE = 128  # lado del tile en px (sobre la imagen ya escalada)
 
-_grabber = {"sct": None, "mon": None, "metodo": None}
+# _grabber["monitor"]: qué se captura.
+#   0            = todos los monitores (pantalla virtual combinada)
+#   1, 2, 3, …   = ese monitor individual (índice mss.monitors[N])
+# _grabber["rect"]: rectángulo en px del monitor activo sobre la pantalla virtual
+#   {left, top, width, height} — lo usa mover_mouse() para reproyectar el input.
+_grabber = {"sct": None, "mon": None, "metodo": None, "monitor": 1, "rect": None}
+
+
+def listar_monitores():
+    """Devuelve [{'id':N,'nombre':str,'w':px,'h':px,'principal':bool}, …] para que
+    el operador elija cuál ver. id=0 es 'Todos'. Usa mss; si falla, cae a GDI
+    (que solo distingue 'principal' vs 'todos')."""
+    salida = [{"id": 0, "nombre": "Todos los monitores", "w": 0, "h": 0, "principal": False}]
+    try:
+        import mss
+        with mss.mss() as sct:
+            mons = sct.monitors  # [0]=virtual, [1..]=cada monitor
+            virt = mons[0]
+            salida[0]["w"], salida[0]["h"] = virt["width"], virt["height"]
+            for i, m in enumerate(mons[1:], start=1):
+                # el monitor principal empieza en (0,0) en coords de Windows
+                principal = (m["left"] == 0 and m["top"] == 0)
+                salida.append({"id": i,
+                               "nombre": f"Monitor {i}" + (" (principal)" if principal else ""),
+                               "w": m["width"], "h": m["height"], "principal": principal})
+    except Exception as e:
+        _log_ctrl(f"[control] listar_monitores mss falló: {e}; fallback GDI")
+        x, y, w, h = _virtual_screen()
+        salida.append({"id": 1, "nombre": "Monitor 1 (principal)",
+                       "w": w, "h": h, "principal": True})
+    return salida
+
+
+def set_monitor(mid: int):
+    """Cambia el monitor activo. Fuerza reinicializar el grabber mss para tomar la
+    nueva geometría."""
+    _grabber["monitor"] = int(mid)
+    _grabber["mon"] = None
+    _grabber["sct"] = None
+    _grabber["rect"] = None
 
 
 def _grab_mss(escala: float):
@@ -145,7 +197,13 @@ def _grab_mss(escala: float):
     if _grabber["sct"] is None:
         import mss
         _grabber["sct"] = mss.mss()
-        _grabber["mon"] = _grabber["sct"].monitors[0]  # 0 = todos los monitores
+        mons = _grabber["sct"].monitors  # [0]=virtual, [1..]=cada monitor
+        mid = _grabber.get("monitor", 1)
+        # id fuera de rango o 0 → todos; si no, el monitor pedido
+        mon = mons[mid] if (0 < mid < len(mons)) else mons[0]
+        _grabber["mon"] = mon
+        _grabber["rect"] = {"left": mon["left"], "top": mon["top"],
+                            "width": mon["width"], "height": mon["height"]}
     raw = _grabber["sct"].grab(_grabber["mon"])
     arr = np.frombuffer(raw.rgb, dtype=np.uint8).reshape(raw.height, raw.width, 3)
     if escala < 0.999:
@@ -157,14 +215,51 @@ def _grab_mss(escala: float):
 
 def _grab_gdi(escala: float):
     """Fallback con PIL ImageGrab (GDI). Más lento pero funciona en sesiones donde
-    mss/DXGI falla (algunas configuraciones de Session 0 / escritorio remoto)."""
+    mss/DXGI falla (algunas configuraciones de Session 0 / escritorio remoto).
+    Respeta el monitor activo: 0=todos (all_screens), N=recorta ese monitor."""
     import numpy as np
     from PIL import ImageGrab
+    mid = _grabber.get("monitor", 1)
     img = ImageGrab.grab(all_screens=True)
+    vsx, vsy, vsw, vsh = _virtual_screen()
+    if mid != 0:
+        # recortar el monitor pedido dentro de la imagen virtual (que arranca en vsx,vsy)
+        try:
+            from ctypes import wintypes
+            monitores = _enum_monitores_win()
+            if 0 < mid <= len(monitores):
+                r = monitores[mid - 1]
+                bx, by = r["left"] - vsx, r["top"] - vsy
+                img = img.crop((bx, by, bx + r["width"], by + r["height"]))
+                _grabber["rect"] = r
+        except Exception as e:
+            _log_ctrl(f"[control] GDI recorte monitor falló: {e}; enviando todo")
+            _grabber["rect"] = {"left": vsx, "top": vsy, "width": vsw, "height": vsh}
+    else:
+        _grabber["rect"] = {"left": vsx, "top": vsy, "width": vsw, "height": vsh}
     if escala < 0.999:
         img = img.resize((max(1, int(img.width * escala)),
                           max(1, int(img.height * escala))))
     return np.ascontiguousarray(np.asarray(img.convert("RGB"), dtype=np.uint8))
+
+
+def _enum_monitores_win():
+    """Enumera monitores vía EnumDisplayMonitors (Win32). Devuelve lista de dicts
+    {left,top,width,height} en coords de la pantalla virtual, orden del sistema."""
+    monitores = []
+    MonitorEnumProc = ctypes.WINFUNCTYPE(
+        ctypes.c_int, wintypes.HANDLE, wintypes.HDC,
+        ctypes.POINTER(wintypes.RECT), wintypes.LPARAM)
+
+    def _cb(hmon, hdc, lprc, lparam):
+        r = lprc.contents
+        monitores.append({"left": r.left, "top": r.top,
+                          "width": r.right - r.left, "height": r.bottom - r.top})
+        return 1
+    user32.EnumDisplayMonitors(0, 0, MonitorEnumProc(_cb), 0)
+    # monitor principal primero (empieza en 0,0), para alinear con mss
+    monitores.sort(key=lambda m: (m["left"] != 0 or m["top"] != 0, m["left"], m["top"]))
+    return monitores
 
 
 def _grab_rgb(escala: float):
@@ -350,17 +445,45 @@ def ejecutar_control(ws_url: str, hostname: str, duracion_max_s: int = 1800,
                 return
             _log_ctrl("[control] autorizado, enviando frames")
 
+            # informar al operador qué monitores hay para que pueda elegir.
+            # default = monitor principal (id 1); si solo hay uno, es transparente.
+            try:
+                mons = listar_monitores()
+                set_monitor(1 if len(mons) > 1 else 0)
+                await ws.send(json.dumps({"t": "monitors", "lista": mons,
+                                          "activo": _grabber["monitor"]}))
+            except Exception as e:
+                _log_ctrl(f"[control] no se pudo listar monitores: {e}")
+
+            # Executor DEDICADO de 1 thread para la captura: mss NO es thread-safe
+            # entre threads distintos, así que el objeto sct siempre se usa desde el
+            # mismo hilo. Aísla el BitBlt/mss del event loop sin romper mss.
+            import concurrent.futures
+            _grab_pool = concurrent.futures.ThreadPoolExecutor(max_workers=1,
+                                                               thread_name_prefix="rbf-grab")
+
             async def enviar_frames():
                 prev = None
                 geom = None  # (cols, rows, w, h) ya enviada al cliente
                 quietos = 0  # frames consecutivos sin cambios (para FPS adaptativo)
+                fallos = 0   # capturas fallidas consecutivas (para degradar)
+                loop = asyncio.get_event_loop()
                 while not estado["stop"]:
                     t_ini = time.monotonic()
                     try:
-                        img = _grab_rgb(estado["escala"])
+                        # CRÍTICO: la captura (BitBlt/mss) es SÍNCRONA y puede colgarse
+                        # (BitBlt timeout). Si se llama directo bloquea el event loop y
+                        # AHOGA recibir_input() → el mouse deja de responder. Corriéndola
+                        # en un thread (executor), el loop sigue procesando el input.
+                        img = await loop.run_in_executor(_grab_pool, _grab_rgb, estado["escala"])
+                        fallos = 0
                     except Exception as e:
-                        _log_ctrl(f"[control] grab error: {e}")
-                        await asyncio.sleep(0.5)
+                        fallos += 1
+                        _log_ctrl(f"[control] grab error #{fallos}: {e}")
+                        # Degradar: si la captura falla repetido, esperar más para no
+                        # saturar el sistema gráfico (deja respirar a otros procesos y
+                        # al input). Backoff hasta 2s.
+                        await asyncio.sleep(min(2.0, 0.3 * fallos))
                         continue
 
                     forzar_key = estado.pop("keyframe", False)
@@ -422,13 +545,20 @@ def ejecutar_control(ws_url: str, hostname: str, duracion_max_s: int = 1800,
                         if m.get("escala") is not None:
                             estado["escala"] = max(0.3, min(1.0, float(m["escala"])))
                             estado["keyframe"] = True  # re-render completo al cambiar escala
+                        if m.get("monitor") is not None:
+                            set_monitor(int(m["monitor"]))
+                            estado["keyframe"] = True  # nueva geometría → cuadro completo
                     elif t == "keyframe":
                         estado["keyframe"] = True  # el cliente pide cuadro completo
                     elif t == "stop":
                         estado["stop"] = True
                         break
 
-            await asyncio.gather(enviar_frames(), recibir_input())
+            try:
+                await asyncio.gather(enviar_frames(), recibir_input())
+            finally:
+                estado["stop"] = True
+                _grab_pool.shutdown(wait=False)
 
     try:
         asyncio.run(run())

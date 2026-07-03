@@ -23,7 +23,7 @@ import urllib.error
 from collectors import inventory
 
 log = logging.getLogger("redbf_agent")
-__version__ = "0.1.3"  # NOTIFICAR auto-verificado: reporta OK solo si el aviso se vio (testigo); ERROR honesto si sesión bloqueada/sin login
+__version__ = "0.1.6"  # fix mouse: (1) matar helpers --control previos con espera confirmada (evita carrera al reenviar INICIAR_CONTROL); (2) captura en executor de 1 thread para que el BitBlt timeout NO ahogue el input (mouse muerto a los minutos); (3) backoff ante fallos de captura
 
 
 def _base_dir() -> Path:
@@ -282,6 +282,51 @@ def _notificar(titulo: str, mensaje: str) -> tuple[str, dict]:
 
 
 # ── Control remoto en vivo ─────────────────────────────────────────
+def _matar_controles_previos(esperar: bool = True):
+    """Mata cualquier helper de control (`redbf-agent.exe --control`) que siga vivo,
+    para no acumular varios inyectando input a la vez. NO toca el servicio principal
+    (que no lleva --control en su línea de comando) ni el proceso actual.
+
+    Usa WMI vía PowerShell para filtrar por CommandLine (tasklist no muestra args).
+    Si `esperar`, verifica en un bucle corto que realmente murieron antes de volver
+    (evita la carrera: si el dashboard reenvía INICIAR_CONTROL rápido, varios
+    helpers arrancan antes de que el Stop-Process surta efecto → pelean por el
+    mouse). Best-effort: si algo falla, no aborta el inicio del control."""
+    import subprocess
+    mi_pid = os.getpid()
+    ps_kill = (
+        "$ps = Get-CimInstance Win32_Process -Filter \"Name='redbf-agent.exe'\" | "
+        "Where-Object { $_.CommandLine -like '*--control*' -and "
+        f"$_.ProcessId -ne {mi_pid} }}; "
+        "$ps | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }; "
+        "($ps | Measure-Object).Count"
+    )
+    def _run(ps):
+        try:
+            r = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
+                               capture_output=True, text=True, timeout=15,
+                               creationflags=0x08000000)  # CREATE_NO_WINDOW
+            return (r.stdout or "").strip()
+        except Exception:
+            return ""
+    _run(ps_kill)
+    if not esperar:
+        return
+    # Confirmar que ya no queda ninguno (hasta ~3s). Cada vuelta re-mata por si
+    # arrancó otro en la carrera.
+    ps_count = (
+        "(Get-CimInstance Win32_Process -Filter \"Name='redbf-agent.exe'\" | "
+        "Where-Object { $_.CommandLine -like '*--control*' -and "
+        f"$_.ProcessId -ne {mi_pid} }} | Measure-Object).Count"
+    )
+    for _ in range(6):
+        c = _run(ps_count)
+        if c == "0" or c == "":
+            return
+        time.sleep(0.5)
+        _run(ps_kill)
+
+
 def _iniciar_control(p: dict) -> tuple[str, dict]:
     """Lanza el módulo de control remoto EN LA SESIÓN DEL USUARIO.
 
@@ -311,6 +356,13 @@ def _iniciar_control(p: dict) -> tuple[str, dict]:
     else:
         agente_py = os.path.abspath(__file__)
         cmdline = f'"{sys.executable}" "{agente_py}" --control "{full_ws}" "{hostname}" "{modo}" "{operador}" "{sslv}"'
+
+    # Evitar helpers de control DUPLICADOS: si ya hay uno corriendo (p.ej. el
+    # dashboard reenvió INICIAR_CONTROL, o quedó un zombi de una sesión previa),
+    # varios helpers inyectarían SendInput a la vez y pelearían por el mouse →
+    # "se ve pero no se controla". Matamos cualquier helper --control previo antes
+    # de lanzar el nuevo, así siempre hay como máximo uno.
+    _matar_controles_previos()
 
     try:
         from collectors import session_helper
