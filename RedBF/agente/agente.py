@@ -23,7 +23,7 @@ import urllib.error
 from collectors import inventory
 
 log = logging.getLogger("redbf_agent")
-__version__ = "0.1.8"  # FIX RAÍZ: helper de control caía en Session 0 (captura falla, mouse muerto) porque las llamadas Win32 (SetTokenInformation/CreateProcessAsUser) truncaban los HANDLE en 64-bit sin argtypes. Ahora declara firmas + verifica sesión + loggea. Incluye teclas especiales v0.1.7
+__version__ = "0.1.9"  # FIX helpers duplicados: 1 solo INICIAR_CONTROL lanzaba 2 helpers (<1s) → mss/DXGI no admite 2 capturadores → "screen grab failed" + mouse en conflicto. Dedup por lock con timestamp (ventana 8s). Incluye fix Session 0 v0.1.8 + teclas v0.1.7
 
 
 def _base_dir() -> Path:
@@ -356,6 +356,29 @@ def _iniciar_control(p: dict) -> tuple[str, dict]:
     else:
         agente_py = os.path.abspath(__file__)
         cmdline = f'"{sys.executable}" "{agente_py}" --control "{full_ws}" "{hostname}" "{modo}" "{operador}" "{sslv}"'
+
+    # DEDUP por tiempo: dos INICIAR_CONTROL casi simultáneos (el mismo comando
+    # tomado por poll+ciclo solapados, o el dashboard reenviando) lanzaban 2 helpers
+    # a <1s de diferencia → matar-previos de cada uno corría ANTES de que el otro
+    # fuera visible en WMI → 2 helpers peleando por el mouse. Un lock con timestamp
+    # ignora cualquier segundo inicio dentro de una ventana corta.
+    import tempfile as _tf
+    lock = os.path.join(_tf.gettempdir(), "_redbf_control.lock")
+    ahora = time.time()
+    try:
+        if os.path.exists(lock):
+            edad = ahora - os.path.getmtime(lock)
+            if edad < 8.0:
+                log.info(f"[control] INICIAR_CONTROL duplicado ignorado "
+                         f"(hace {edad:.1f}s se lanzó otro)")
+                return "OK", {"mensaje": "control ya iniciándose (dedup)", "ws": full_ws}
+    except Exception:
+        pass
+    try:
+        with open(lock, "w") as _f:
+            _f.write(str(ahora))
+    except Exception:
+        pass
 
     # Evitar helpers de control DUPLICADOS: si ya hay uno corriendo (p.ej. el
     # dashboard reenvió INICIAR_CONTROL, o quedó un zombi de una sesión previa),

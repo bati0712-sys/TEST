@@ -309,7 +309,15 @@ def _grab_rgb(escala: float):
         _log_ctrl(f"[control] mss falló ({type(e).__name__}: {e}); usando GDI")
         _grabber["sct"] = None
         _grabber["metodo"] = "gdi"
-        return _grab_gdi(escala)
+        try:
+            return _grab_gdi(escala)
+        except Exception as ge:
+            # Loguear la excepción REAL de GDI (antes se perdía como "screen grab
+            # failed" genérico). Reintentar mss la próxima vez (no fijarse en gdi si
+            # gdi también falla — puede ser un estado transitorio del escritorio).
+            _log_ctrl(f"[control] GDI también falló ({type(ge).__name__}: {ge})")
+            _grabber["metodo"] = "auto"
+            raise
 
 
 def _grab_jpeg(calidad: int) -> bytes | None:
