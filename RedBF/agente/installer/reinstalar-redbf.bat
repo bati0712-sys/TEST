@@ -1,6 +1,6 @@
 @echo off
 REM ============================================================
-REM  REINSTALACION LIMPIA del RedBF Agent -> v0.1.10
+REM  REINSTALACION LIMPIA del RedBF Agent -> v0.1.11
 REM  Elimina el servicio NSSM viejo (que se cuelga) y lo instala
 REM  fresco. Reusa el config.ini que YA esta en la PC (con su token),
 REM  asi este paquete NO lleva el token escrito.
@@ -21,7 +21,7 @@ if errorlevel 1 ( echo [ERROR] Ejecutar como Administrador ^(click derecho^) & p
 
 echo.
 echo ============================================================
-echo  REINSTALACION LIMPIA - RedBF Agent v0.1.10
+echo  REINSTALACION LIMPIA - RedBF Agent v0.1.11
 echo  Carpeta: %INSTALL_DIR%
 echo ============================================================
 echo.
@@ -100,7 +100,7 @@ echo [7/7] Verificando...
 sc query %SERVICE% | find "RUNNING" >nul && (
     echo.
     echo  ============================================================
-    echo   OK - Agente v0.1.10 instalado y RUNNING.
+    echo   OK - Agente v0.1.11 instalado y RUNNING.
     echo   El equipo aparecera actualizado en el dashboard en ~1-2 min.
     echo  ============================================================
 ) || (

@@ -23,7 +23,7 @@ import urllib.error
 from collectors import inventory
 
 log = logging.getLogger("redbf_agent")
-__version__ = "0.1.10"  # feat: portapapeles compartido (t=="clipboard"/"get_clipboard") entre operador y PC remota. Incluye dedup helpers v0.1.9 + fix Session 0 v0.1.8 + teclas v0.1.7
+__version__ = "0.1.11"  # feat: transferencia de archivos (RECIBIR/ENVIAR_ARCHIVO/LISTAR_CARPETA, límite 10MB). Incluye portapapeles v0.1.10 + dedup helpers v0.1.9 + fix Session 0 v0.1.8
 
 
 def _base_dir() -> Path:
@@ -501,6 +501,86 @@ def _lanzar_en_sesion_async(cmdline: str) -> bool:
     return bool(created)
 
 
+# ── Transferencia de archivos ──────────────────────────────────────
+_MAX_ARCHIVO = 10 * 1024 * 1024  # 10 MB (límite acorde a la cola de comandos)
+
+
+def _recibir_archivo(p: dict) -> tuple[str, dict]:
+    """Escribe un archivo enviado desde el dashboard. p = {ruta, contenido_b64}.
+    ruta puede ser una carpeta destino o un path completo."""
+    import base64
+    ruta = p.get("ruta", "")
+    b64 = p.get("contenido_b64", "")
+    nombre = p.get("nombre", "")
+    if not ruta:
+        return "ERROR", {"error": "falta la ruta destino"}
+    try:
+        data = base64.b64decode(b64)
+    except Exception as e:
+        return "ERROR", {"error": f"base64 inválido: {e}"}
+    if len(data) > _MAX_ARCHIVO:
+        return "ERROR", {"error": f"archivo muy grande ({len(data)} bytes, máx {_MAX_ARCHIVO})"}
+    # si ruta es una carpeta existente y hay nombre, componer el path
+    if nombre and (os.path.isdir(ruta) or ruta.endswith(("\\", "/"))):
+        destino = os.path.join(ruta, nombre)
+    else:
+        destino = ruta
+    try:
+        os.makedirs(os.path.dirname(destino) or ".", exist_ok=True)
+        with open(destino, "wb") as f:
+            f.write(data)
+        return "OK", {"destino": destino, "bytes": len(data)}
+    except Exception as e:
+        return "ERROR", {"error": f"no pude escribir {destino}: {e}"}
+
+
+def _enviar_archivo(p: dict) -> tuple[str, dict]:
+    """Lee un archivo de la PC y lo devuelve en base64. p = {ruta}."""
+    import base64
+    ruta = p.get("ruta", "")
+    if not ruta or not os.path.isfile(ruta):
+        return "ERROR", {"error": f"no existe el archivo: {ruta}"}
+    try:
+        tam = os.path.getsize(ruta)
+        if tam > _MAX_ARCHIVO:
+            return "ERROR", {"error": f"archivo muy grande ({tam} bytes, máx {_MAX_ARCHIVO}). "
+                                      f"Usá control remoto o comprimilo."}
+        with open(ruta, "rb") as f:
+            data = f.read()
+        return "OK", {"nombre": os.path.basename(ruta), "bytes": tam,
+                      "contenido_b64": base64.b64encode(data).decode("ascii")}
+    except Exception as e:
+        return "ERROR", {"error": f"no pude leer {ruta}: {e}"}
+
+
+def _listar_carpeta(p: dict) -> tuple[str, dict]:
+    """Lista archivos/carpetas de un directorio. p = {ruta} (default: unidades)."""
+    ruta = p.get("ruta", "")
+    try:
+        if not ruta:
+            # listar unidades disponibles
+            import string
+            drives = [f"{d}:\\" for d in string.ascii_uppercase
+                      if os.path.exists(f"{d}:\\")]
+            return "OK", {"ruta": "", "items": [{"nombre": d, "tipo": "dir"} for d in drives]}
+        if not os.path.isdir(ruta):
+            return "ERROR", {"error": f"no es una carpeta: {ruta}"}
+        items = []
+        for n in sorted(os.listdir(ruta)):
+            full = os.path.join(ruta, n)
+            try:
+                es_dir = os.path.isdir(full)
+                items.append({"nombre": n, "tipo": "dir" if es_dir else "file",
+                              "bytes": 0 if es_dir else os.path.getsize(full)})
+            except Exception:
+                pass
+        # padre para navegar hacia arriba
+        padre = os.path.dirname(ruta.rstrip("\\/")) if ruta.rstrip("\\/") else ""
+        return "OK", {"ruta": ruta, "padre": padre, "items": items[:500]}
+    except Exception as e:
+        return "ERROR", {"error": f"{type(e).__name__}: {e}"}
+
+
 # ── Ejecución de comandos (Fase 3) ─────────────────────────────────
 def ejecutar_comando(cmd: dict) -> tuple[str, dict]:
     """Ejecuta un comando recibido del servidor. Retorna (estado, resultado)."""
@@ -539,6 +619,12 @@ def ejecutar_comando(cmd: dict) -> tuple[str, dict]:
             return _iniciar_control(p)
         elif tipo == "NOTIFICAR":
             return _notificar(p.get("titulo", "RedBF"), p.get("mensaje", ""))
+        elif tipo == "RECIBIR_ARCHIVO":
+            return _recibir_archivo(p)
+        elif tipo == "ENVIAR_ARCHIVO":
+            return _enviar_archivo(p)
+        elif tipo == "LISTAR_CARPETA":
+            return _listar_carpeta(p)
         else:
             return "ERROR", {"error": f"tipo desconocido: {tipo}"}
     except Exception as e:
