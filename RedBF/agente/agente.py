@@ -23,7 +23,7 @@ import urllib.error
 from collectors import inventory
 
 log = logging.getLogger("redbf_agent")
-__version__ = "0.1.6"  # fix mouse: (1) matar helpers --control previos con espera confirmada (evita carrera al reenviar INICIAR_CONTROL); (2) captura en executor de 1 thread para que el BitBlt timeout NO ahogue el input (mouse muerto a los minutos); (3) backoff ante fallos de captura
+__version__ = "0.1.8"  # FIX RAÍZ: helper de control caía en Session 0 (captura falla, mouse muerto) porque las llamadas Win32 (SetTokenInformation/CreateProcessAsUser) truncaban los HANDLE en 64-bit sin argtypes. Ahora declara firmas + verifica sesión + loggea. Incluye teclas especiales v0.1.7
 
 
 def _base_dir() -> Path:
@@ -383,46 +383,98 @@ def _iniciar_control(p: dict) -> tuple[str, dict]:
 
 def _lanzar_en_sesion_async(cmdline: str) -> bool:
     """Como session_helper.ejecutar_en_sesion_usuario pero SIN esperar (el control
-    es un proceso de larga duración)."""
+    es un proceso de larga duración).
+
+    BUG HISTÓRICO (v<=0.1.7): las funciones Win32 se llamaban SIN declarar
+    argtypes/restype. En Windows 64-bit, ctypes asume c_int (32 bits) para cada
+    argumento → los HANDLE (punteros de 64 bits) se TRUNCABAN → SetTokenInformation
+    fallaba silenciosamente y el proceso caía en Session 0 (captura falla, mouse no
+    responde). Fix: declarar argtypes/restype para que los HANDLE pasen enteros +
+    verificar SetTokenInformation + loggear la sesión final del proceso.
+    """
     from collectors import session_helper as sh
     import ctypes
     from ctypes import wintypes
+
+    k32 = ctypes.windll.kernel32
+    adv = ctypes.windll.advapi32
+    wts = ctypes.windll.wtsapi32
+    uenv = ctypes.windll.userenv
+
+    # ── Declarar firmas (CRÍTICO en 64-bit para no truncar los HANDLE) ──
+    wts.WTSQueryUserToken.argtypes = [wintypes.DWORD, ctypes.POINTER(wintypes.HANDLE)]
+    wts.WTSQueryUserToken.restype = wintypes.BOOL
+    adv.DuplicateTokenEx.argtypes = [wintypes.HANDLE, wintypes.DWORD, ctypes.c_void_p,
+                                     ctypes.c_int, ctypes.c_int,
+                                     ctypes.POINTER(wintypes.HANDLE)]
+    adv.DuplicateTokenEx.restype = wintypes.BOOL
+    adv.SetTokenInformation.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p,
+                                        wintypes.DWORD]
+    adv.SetTokenInformation.restype = wintypes.BOOL
+    uenv.CreateEnvironmentBlock.argtypes = [ctypes.POINTER(ctypes.c_void_p),
+                                            wintypes.HANDLE, wintypes.BOOL]
+    uenv.CreateEnvironmentBlock.restype = wintypes.BOOL
+    adv.CreateProcessAsUserW.argtypes = [
+        wintypes.HANDLE, wintypes.LPCWSTR, wintypes.LPWSTR, ctypes.c_void_p,
+        ctypes.c_void_p, wintypes.BOOL, wintypes.DWORD, ctypes.c_void_p,
+        wintypes.LPCWSTR, ctypes.c_void_p, ctypes.c_void_p]
+    adv.CreateProcessAsUserW.restype = wintypes.BOOL
+    k32.CloseHandle.argtypes = [wintypes.HANDLE]
+    k32.ProcessIdToSessionId.argtypes = [wintypes.DWORD, ctypes.POINTER(wintypes.DWORD)]
+    k32.ProcessIdToSessionId.restype = wintypes.BOOL
+
     sid = sh._sesion_activa()
     if sid is None:
+        log.warning("[control] no hay sesión interactiva activa (nadie logueado)")
         return False
     user_token = wintypes.HANDLE()
-    if not ctypes.windll.wtsapi32.WTSQueryUserToken(sid, ctypes.byref(user_token)):
+    if not wts.WTSQueryUserToken(sid, ctypes.byref(user_token)):
+        log.warning(f"[control] WTSQueryUserToken falló (sesión {sid}, err={k32.GetLastError()})")
         return False
     dup = wintypes.HANDLE()
-    ok = ctypes.windll.advapi32.DuplicateTokenEx(
+    ok = adv.DuplicateTokenEx(
         user_token, sh.TOKEN_ALL_FOR_PROCESS, None, sh.SecurityImpersonation,
         sh.TokenPrimary, ctypes.byref(dup))
-    ctypes.windll.kernel32.CloseHandle(user_token)
+    k32.CloseHandle(user_token)
     if not ok:
+        log.warning(f"[control] DuplicateTokenEx falló (err={k32.GetLastError()})")
         return False
     # CRÍTICO: forzar el SessionId del token a la sesión interactiva. Sin esto, el
-    # token duplicado a veces queda en Session 0 y CreateProcessAsUser lanza el
-    # proceso en Session 0 (sin escritorio del usuario) → captura sí, pero NO input
-    # ni notificaciones. Con TokenSessionId el proceso va a la sesión del usuario.
+    # token duplicado queda en Session 0 y CreateProcessAsUser lanza el proceso en
+    # Session 0 (sin escritorio del usuario) → captura falla y NO hay input.
     TokenSessionId = 12
     sid_dword = wintypes.DWORD(sid)
-    ctypes.windll.advapi32.SetTokenInformation(
-        dup, TokenSessionId, ctypes.byref(sid_dword), ctypes.sizeof(sid_dword))
+    if not adv.SetTokenInformation(dup, TokenSessionId, ctypes.byref(sid_dword),
+                                   ctypes.sizeof(sid_dword)):
+        # ya no debería fallar con argtypes correctos; si falla, logueamos y seguimos
+        log.warning(f"[control] SetTokenInformation(SessionId={sid}) falló "
+                    f"(err={k32.GetLastError()}) — el proceso podría caer en Session 0")
     env = ctypes.c_void_p()
-    ctypes.windll.userenv.CreateEnvironmentBlock(ctypes.byref(env), dup, False)
+    uenv.CreateEnvironmentBlock(ctypes.byref(env), dup, False)
     si = sh.STARTUPINFO(); si.cb = ctypes.sizeof(sh.STARTUPINFO)
     si.lpDesktop = "winsta0\\default"
     pi = sh.PROCESS_INFORMATION()
     flags = sh.CREATE_UNICODE_ENVIRONMENT | sh.CREATE_NO_WINDOW | sh.NORMAL_PRIORITY_CLASS
-    created = ctypes.windll.advapi32.CreateProcessAsUserW(
+    created = adv.CreateProcessAsUserW(
         dup, None, ctypes.c_wchar_p(cmdline), None, None, False,
         flags, env, None, ctypes.byref(si), ctypes.byref(pi))
     if created:
-        ctypes.windll.kernel32.CloseHandle(pi.hProcess)
-        ctypes.windll.kernel32.CloseHandle(pi.hThread)
+        # Diagnóstico: confirmar en qué sesión quedó realmente el proceso.
+        try:
+            psid = wintypes.DWORD()
+            if k32.ProcessIdToSessionId(pi.dwProcessId, ctypes.byref(psid)):
+                nivel = log.info if psid.value == sid else log.warning
+                nivel(f"[control] helper lanzado PID={pi.dwProcessId} en Session "
+                      f"{psid.value} (objetivo={sid})")
+        except Exception:
+            pass
+        k32.CloseHandle(pi.hProcess)
+        k32.CloseHandle(pi.hThread)
+    else:
+        log.warning(f"[control] CreateProcessAsUserW falló (err={k32.GetLastError()})")
     if env:
-        ctypes.windll.userenv.DestroyEnvironmentBlock(env)
-    ctypes.windll.kernel32.CloseHandle(dup)
+        uenv.DestroyEnvironmentBlock(env)
+    k32.CloseHandle(dup)
     return bool(created)
 
 

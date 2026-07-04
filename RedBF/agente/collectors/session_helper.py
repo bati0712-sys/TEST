@@ -66,6 +66,45 @@ class PROCESS_INFORMATION(ctypes.Structure):
     ]
 
 
+# ── Firmas Win32 (CRÍTICO en 64-bit) ───────────────────────────────
+# Sin argtypes, ctypes asume c_int (32 bits) por argumento y TRUNCA los HANDLE
+# (punteros de 64 bits) → SetTokenInformation falla y el proceso cae en Session 0
+# (sin escritorio: captura falla, no hay input, notificaciones invisibles).
+def _declarar_firmas():
+    try:
+        adv = ctypes.windll.advapi32
+        wts = ctypes.windll.wtsapi32
+        uenv = ctypes.windll.userenv
+        k32 = ctypes.windll.kernel32
+        wts.WTSQueryUserToken.argtypes = [wintypes.DWORD, ctypes.POINTER(wintypes.HANDLE)]
+        wts.WTSQueryUserToken.restype = wintypes.BOOL
+        adv.DuplicateTokenEx.argtypes = [wintypes.HANDLE, wintypes.DWORD, ctypes.c_void_p,
+                                         ctypes.c_int, ctypes.c_int,
+                                         ctypes.POINTER(wintypes.HANDLE)]
+        adv.DuplicateTokenEx.restype = wintypes.BOOL
+        adv.SetTokenInformation.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p,
+                                            wintypes.DWORD]
+        adv.SetTokenInformation.restype = wintypes.BOOL
+        uenv.CreateEnvironmentBlock.argtypes = [ctypes.POINTER(ctypes.c_void_p),
+                                                wintypes.HANDLE, wintypes.BOOL]
+        uenv.CreateEnvironmentBlock.restype = wintypes.BOOL
+        adv.CreateProcessAsUserW.argtypes = [
+            wintypes.HANDLE, wintypes.LPCWSTR, wintypes.LPWSTR, ctypes.c_void_p,
+            ctypes.c_void_p, wintypes.BOOL, wintypes.DWORD, ctypes.c_void_p,
+            wintypes.LPCWSTR, ctypes.c_void_p, ctypes.c_void_p]
+        adv.CreateProcessAsUserW.restype = wintypes.BOOL
+        k32.CloseHandle.argtypes = [wintypes.HANDLE]
+        k32.ProcessIdToSessionId.argtypes = [wintypes.DWORD, ctypes.POINTER(wintypes.DWORD)]
+        k32.ProcessIdToSessionId.restype = wintypes.BOOL
+        k32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+        k32.WaitForSingleObject.restype = wintypes.DWORD
+    except Exception:
+        pass
+
+
+_declarar_firmas()
+
+
 def en_session0() -> bool:
     try:
         sid = wintypes.DWORD()

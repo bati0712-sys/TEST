@@ -144,6 +144,39 @@ def escribir_unicode(ch: str):
         _send(inp)
 
 
+# Teclas extendidas: necesitan KEYEVENTF_EXTENDEDKEY para que Windows las
+# distinga (flechas, Ins/Del/Home/End/PgUp/PgDn, Win izq/der, Ctrl/Alt der).
+KEYEVENTF_EXTENDEDKEY = 0x0001
+_VK_EXTENDIDAS = {0x2D, 0x2E, 0x24, 0x23, 0x21, 0x22,   # Ins Del Home End PgUp PgDn
+                  0x25, 0x26, 0x27, 0x28,                # ← ↑ → ↓
+                  0x5B, 0x5C,                            # Win izq/der
+                  0xA3, 0xA5, 0x2C}                      # Ctrl der, Alt der, PrintScreen
+
+
+def _tecla_ext(vk: int, accion: str):
+    """Como tecla() pero marca EXTENDEDKEY cuando corresponde (combos correctos)."""
+    flags = KEYEVENTF_KEYUP if accion == "up" else 0
+    if vk in _VK_EXTENDIDAS:
+        flags |= KEYEVENTF_EXTENDEDKEY
+    inp = INPUT(type=INPUT_KEYBOARD)
+    inp.u.ki = KEYBDINPUT(vk, 0, flags, 0, None)
+    _send(inp)
+
+
+def combo(vks):
+    """Presiona una secuencia de Virtual-Keys COMO combinación: las presiona en
+    orden y las suelta en orden inverso (p.ej. [CTRL, ALT, END] = Ctrl+Alt+End).
+    Nota: Ctrl+Alt+Supr real (SAS) NO se puede inyectar por diseño de Windows;
+    el dashboard usa Ctrl+Alt+End (equivalente en RDP) en su lugar."""
+    vks = [int(v) for v in vks if v is not None]
+    if not vks:
+        return
+    for v in vks:
+        _tecla_ext(v, "down")
+    for v in reversed(vks):
+        _tecla_ext(v, "up")
+
+
 # ── Captura para streaming ─────────────────────────────────────────
 # Nivel 1: captura rápida (mss) + diff por tiles. Solo se envían los bloques
 # que cambiaron respecto al frame anterior, como un mensaje BINARIO. En uso de
@@ -539,6 +572,13 @@ def ejecutar_control(ws_url: str, hostname: str, duracion_max_s: int = 1800,
                             escribir_unicode(m["char"])
                         elif m.get("vk") is not None:
                             tecla(int(m["vk"]), m.get("action", "down"))
+                    elif t == "combo":
+                        # combinación de teclas especial (Ctrl+Alt+End, Win+L, etc.)
+                        vks = m.get("vks") or []
+                        try:
+                            combo(vks)
+                        except Exception as e:
+                            _log_ctrl(f"[control] combo error: {e}")
                     elif t == "config":
                         estado["fps"] = int(m.get("fps", estado["fps"]))
                         estado["calidad"] = int(m.get("calidad", estado["calidad"]))
