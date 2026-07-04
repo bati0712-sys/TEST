@@ -23,7 +23,7 @@ import urllib.error
 from collectors import inventory
 
 log = logging.getLogger("redbf_agent")
-__version__ = "0.1.9"  # FIX helpers duplicados: 1 solo INICIAR_CONTROL lanzaba 2 helpers (<1s) → mss/DXGI no admite 2 capturadores → "screen grab failed" + mouse en conflicto. Dedup por lock con timestamp (ventana 8s). Incluye fix Session 0 v0.1.8 + teclas v0.1.7
+__version__ = "0.1.10"  # feat: portapapeles compartido (t=="clipboard"/"get_clipboard") entre operador y PC remota. Incluye dedup helpers v0.1.9 + fix Session 0 v0.1.8 + teclas v0.1.7
 
 
 def _base_dir() -> Path:

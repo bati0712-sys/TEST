@@ -418,6 +418,63 @@ def pedir_consentimiento(operador: str, timeout_s: int = 30) -> bool:
         return False
 
 
+# ── Portapapeles (clipboard) compartido ────────────────────────────
+CF_UNICODETEXT = 13
+GMEM_MOVEABLE = 0x0002
+
+
+def leer_clipboard() -> str | None:
+    """Lee texto Unicode del portapapeles de la sesión del usuario. None si vacío
+    o si no se pudo abrir (otra app lo tiene tomado)."""
+    u = ctypes.windll.user32
+    k = ctypes.windll.kernel32
+    try:
+        if not u.OpenClipboard(0):
+            return None
+        try:
+            if not u.IsClipboardFormatAvailable(CF_UNICODETEXT):
+                return None
+            h = u.GetClipboardData(CF_UNICODETEXT)
+            if not h:
+                return None
+            ptr = k.GlobalLock(h)
+            if not ptr:
+                return None
+            try:
+                return ctypes.c_wchar_p(ptr).value
+            finally:
+                k.GlobalUnlock(h)
+        finally:
+            u.CloseClipboard()
+    except Exception:
+        return None
+
+
+def escribir_clipboard(texto: str) -> bool:
+    """Pone `texto` en el portapapeles de la sesión del usuario."""
+    u = ctypes.windll.user32
+    k = ctypes.windll.kernel32
+    try:
+        if not u.OpenClipboard(0):
+            return False
+        try:
+            u.EmptyClipboard()
+            data = ctypes.create_unicode_buffer(texto)
+            size = ctypes.sizeof(data)
+            h = k.GlobalAlloc(GMEM_MOVEABLE, size)
+            if not h:
+                return False
+            ptr = k.GlobalLock(h)
+            ctypes.memmove(ptr, data, size)
+            k.GlobalUnlock(h)
+            u.SetClipboardData(CF_UNICODETEXT, h)
+            return True
+        finally:
+            u.CloseClipboard()
+    except Exception:
+        return False
+
+
 def ejecutar_control(ws_url: str, hostname: str, duracion_max_s: int = 1800,
                      modo: str = "consentimiento", operador: str = "Sistemas",
                      ssl_verify: bool = True):
@@ -433,7 +490,7 @@ def ejecutar_control(ws_url: str, hostname: str, duracion_max_s: int = 1800,
     import ssl as _ssl
 
     estado = {"fps": 12, "calidad": 55, "stop": False, "escala": 1.0,
-              "keyframe": False}
+              "keyframe": False, "clip_last": None}
     _log_ctrl(f"[control] iniciando, url={ws_url[:80]} modo={modo}")
 
     async def run():
@@ -587,6 +644,19 @@ def ejecutar_control(ws_url: str, hostname: str, duracion_max_s: int = 1800,
                             combo(vks)
                         except Exception as e:
                             _log_ctrl(f"[control] combo error: {e}")
+                    elif t == "clipboard":
+                        # el operador envió texto → ponerlo en el clipboard remoto
+                        txt = m.get("texto", "")
+                        if escribir_clipboard(txt):
+                            estado["clip_last"] = txt  # no re-emitir lo que acabamos de poner
+                    elif t == "get_clipboard":
+                        # el operador pide el clipboard actual de la PC remota
+                        cur = leer_clipboard()
+                        if cur is not None:
+                            try:
+                                await ws.send(json.dumps({"t": "clipboard", "texto": cur}))
+                            except Exception:
+                                pass
                     elif t == "config":
                         estado["fps"] = int(m.get("fps", estado["fps"]))
                         estado["calidad"] = int(m.get("calidad", estado["calidad"]))
